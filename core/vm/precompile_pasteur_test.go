@@ -6,59 +6,59 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// 0x64/0x65 are deprecated from Pasteur; 0x67 switches to a per-byte-priced variant.
+// DashEVM: the classical signature precompiles 0x64 to 0x69 are disabled in
+// every precompile set (contracts_finallayer.go), Pasteur included, and 0x68 is
+// the ML-DSA double sign evidence precompile. The upstream gas behaviour of the
+// 0x67 implementations is still checked on the implementations themselves.
 func TestPasteurSuspendsLegacyTendermintPrecompiles(t *testing.T) {
-	addr64 := common.BytesToAddress([]byte{0x64})
-	addr65 := common.BytesToAddress([]byte{0x65})
-
-	// Under Pasteur, 0x64/0x65 return "deprecated" for any input.
-	for _, addr := range []common.Address{addr64, addr65} {
-		p := PrecompiledContractsPasteur[addr]
-		if p == nil {
-			t.Fatalf("%s missing from Pasteur precompile set", addr.Hex())
+	sets := map[string]PrecompiledContracts{
+		"Pasteur":     PrecompiledContractsPasteur,
+		"OsakaForBSC": PrecompiledContractsOsakaForBSC,
+	}
+	for name, set := range sets {
+		for _, b := range []byte{0x64, 0x65, 0x66, 0x67, 0x69} {
+			addr := common.BytesToAddress([]byte{b})
+			p, ok := set[addr].(*disabledPrecompile)
+			if !ok {
+				t.Fatalf("%s: %s must be the disabled stub, got %T", name, addr.Hex(), set[addr])
+			}
+			if _, err := p.Run([]byte("x")); err != ErrExecutionReverted {
+				t.Fatalf("%s: %s must revert, got %v", name, addr.Hex(), err)
+			}
 		}
-		if _, err := p.Run([]byte("x")); err == nil || err.Error() != "deprecated" {
-			t.Fatalf("%s under Pasteur: expected deprecated error, got %v", addr.Hex(), err)
-		}
-	}
-
-	// Pre-Pasteur (Osaka) they are still the live, active implementations. These
-	// tendermint precompiles live only in the BSC set (…ForBSC); the standard
-	// PrecompiledContractsOsaka has them stripped for non-BSC chains.
-	if _, ok := PrecompiledContractsOsakaForBSC[addr64].(*tmHeaderValidate); !ok {
-		t.Fatalf("0x64 must remain active (tmHeaderValidate) pre-Pasteur")
-	}
-	if _, ok := PrecompiledContractsOsakaForBSC[addr65].(*iavlMerkleProofValidatePlato); !ok {
-		t.Fatalf("0x65 must remain active (iavlMerkleProofValidatePlato) pre-Pasteur")
-	}
-
-	// 0x67 stays active but switches to the per-byte-priced Pasteur variant
-	// (Hertz/flat-gas pre-Pasteur, for replay of earlier blocks).
-	addr67 := common.BytesToAddress([]byte{0x67})
-	if _, ok := PrecompiledContractsPasteur[addr67].(*cometBFTLightBlockValidatePasteur); !ok {
-		t.Fatalf("0x67 must be the Pasteur variant under Pasteur")
-	}
-	if _, ok := PrecompiledContractsOsakaForBSC[addr67].(*cometBFTLightBlockValidateHertz); !ok {
-		t.Fatalf("0x67 must remain the Hertz variant pre-Pasteur")
-	}
-
-	// The still-needed precompiles (0x66, 0x68, 0x69) remain present under Pasteur.
-	for _, b := range []byte{0x66, 0x68, 0x69} {
-		addr := common.BytesToAddress([]byte{b})
-		if PrecompiledContractsPasteur[addr] == nil {
-			t.Fatalf("%s must remain present under Pasteur", addr.Hex())
+		if _, ok := set[common.BytesToAddress([]byte{0x68})].(*pqDoubleSignEvidence); !ok {
+			t.Fatalf("%s: 0x68 must be the PQ double sign evidence precompile", name)
 		}
 	}
 
-	// 0x67 gas scales with input size under Pasteur, but is flat pre-Pasteur.
+	// The BSC double sign implementation (ECDSA headers) is in no set.
+	all := []PrecompiledContracts{
+		PrecompiledContractsHomestead, PrecompiledContractsByzantium, PrecompiledContractsIstanbulForBSC,
+		PrecompiledContractsNano, PrecompiledContractsMoran, PrecompiledContractsPlanck,
+		PrecompiledContractsLuban, PrecompiledContractsPlato, PrecompiledContractsBerlin,
+		PrecompiledContractsHertz, PrecompiledContractsFeynman, PrecompiledContractsCancunForBSC,
+		PrecompiledContractsHaber, PrecompiledContractsPragueForBSC, PrecompiledContractsOsakaForBSC,
+		PrecompiledContractsPasteur, PrecompiledContractsIstanbul, PrecompiledContractsCancun,
+		PrecompiledContractsPrague, PrecompiledContractsOsaka, PrecompiledContractsP256Verify,
+	}
+	for i, set := range all {
+		for addr, p := range set {
+			if _, bad := p.(*verifyDoubleSignEvidence); bad {
+				t.Fatalf("set %d: %s is the BSC double sign implementation", i, addr.Hex())
+			}
+		}
+	}
+
+	// 0x67 gas scales with input size in the Pasteur variant and is flat in the
+	// Hertz variant.
 	small := make([]byte, 1024)
 	large := make([]byte, 16*1024)
-	pasteur67 := PrecompiledContractsPasteur[addr67]
+	pasteur67 := &cometBFTLightBlockValidatePasteur{}
 	if pasteur67.RequiredGas(large) <= pasteur67.RequiredGas(small) {
 		t.Fatalf("Pasteur 0x67 gas must scale with input size")
 	}
-	osaka67 := PrecompiledContractsOsakaForBSC[addr67]
-	if osaka67.RequiredGas(large) != osaka67.RequiredGas(small) {
+	hertz67 := &cometBFTLightBlockValidateHertz{}
+	if hertz67.RequiredGas(large) != hertz67.RequiredGas(small) {
 		t.Fatalf("pre-Pasteur 0x67 gas must stay flat")
 	}
 }

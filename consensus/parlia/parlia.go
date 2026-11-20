@@ -202,10 +202,10 @@ func isToSystemContract(to common.Address) bool {
 }
 
 // ParliaRLP returns the rlp bytes which needs to be signed for the parlia
-// sealing. The RLP to sign consists of the entire header apart from the 65 byte signature
-// contained at the end of the extra data.
+// sealing. The RLP to sign consists of the entire header apart from the ML-DSA seal
+// (pq.SealSize bytes) at the end of the extra data.
 //
-// Note, the method requires the extra data to be at least 65 bytes, otherwise it
+// Note, the method requires the extra data to be at least pq.SealSize bytes, otherwise it
 // panics. This is done to avoid accidentally using both forms (signature present
 // or not), which could be abused to produce different hashes for the same header.
 func ParliaRLP(header *types.Header, chainId *big.Int) []byte {

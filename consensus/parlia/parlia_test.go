@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	mrand "math/rand"
@@ -27,6 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
+	"github.com/ethereum/go-ethereum/crypto/pq"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
@@ -694,9 +696,19 @@ func TestParlia_applyTransactionTracing(t *testing.T) {
 		t.Fatalf("failed to pack system contract method %s: %v", method, err)
 	}
 
-	msg := engine.getSystemMessage(genesisBlock.Coinbase(), common.HexToAddress(systemcontracts.ValidatorContract), data, common.Big0)
+	// DashEVM: the imported system tx must be an ML-DSA-87 PQ transaction
+	// signed by its sender, the block producer.
+	pqKey, err := pq.GenerateKey()
+	if err != nil {
+		t.Fatalf("failed to generate validator key: %v", err)
+	}
+	producer, _, signTxFn := PQSignerFns(pqKey)
+	msg := engine.getSystemMessage(producer, common.HexToAddress(systemcontracts.ValidatorContract), data, common.Big0)
 	nonce := stateDB.GetNonce(msg.From)
-	expectedTx := types.NewTransaction(nonce, *msg.To, msg.Value.ToBig(), msg.GasLimit, msg.GasPrice.ToBig(), msg.Data)
+	expectedTx, err := signTxFn(accounts.Account{Address: producer}, types.NewTransaction(nonce, *msg.To, msg.Value.ToBig(), msg.GasLimit, msg.GasPrice.ToBig(), msg.Data), config.ChainID)
+	if err != nil {
+		t.Fatalf("failed to sign system tx: %v", err)
+	}
 
 	receivedTxs := []*types.Transaction{expectedTx}
 	txs := make([]*types.Transaction, 0, 1)
@@ -712,13 +724,15 @@ func TestParlia_applyTransactionTracing(t *testing.T) {
 		t.Fatalf("failed to apply system contract transaction: %v", applyErr)
 	}
 
+	// The ML-DSA signature makes the tx hash differ per run.
+	txHash, from := expectedTx.Hash().Hex(), producer.Hex()
 	expectedRecords := []string{
 		"system tx start",
-		"tx [0xe9a5597c7f5a6a10a18959d262319fbf19cecb4d9d1ce8f2c990089bd88016fc] from [0x0000000000000000000000000000000000000000] start",
-		"call enter [0x0000000000000000000000000000000000000000] -> [0x0000000000000000000000000000000000001000] (type 241, gas 9223372036854775807, value 0)",
+		"tx [" + txHash + "] from [" + from + "] start",
+		"call enter [" + from + "] -> [0x0000000000000000000000000000000000001000] (type 241, gas 9223372036854775807, value 0)",
 		"call exit (depth 0, gas used 0, reverted false, err: <none>)",
-		"nonce change [0x0000000000000000000000000000000000000000]: 0 -> 1",
-		"tx [0xe9a5597c7f5a6a10a18959d262319fbf19cecb4d9d1ce8f2c990089bd88016fc] end (log count 0, cumulative gas used 0, err: <none>)",
+		"nonce change [" + from + "]: 0 -> 1",
+		"tx [" + txHash + "] end (log count 0, cumulative gas used 0, err: <none>)",
 		"system tx end",
 	}
 
@@ -750,17 +764,14 @@ func TestParlia_applyTransactionModes(t *testing.T) {
 	header := parents[0].Header()
 
 	engine := New(config, db, nil, genesisBlock.Hash())
-	validatorKey, err := crypto.GenerateKey()
+	// DashEVM: system transactions are ML-DSA-87 PQ transactions signed by the
+	// block producer, so the validator signs with the node's PQ signer.
+	validatorKey, err := pq.GenerateKey()
 	if err != nil {
 		t.Fatalf("failed to generate validator key: %v", err)
 	}
-	validator := crypto.PubkeyToAddress(validatorKey.PublicKey)
-	engine.Authorize(validator, nil, func(account accounts.Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) {
-		if account.Address != validator {
-			return nil, fmt.Errorf("unexpected signing account %s", account.Address)
-		}
-		return types.SignTx(tx, types.LatestSigner(config), validatorKey)
-	})
+	validator, _, signTxFn := PQSignerFns(validatorKey)
+	engine.Authorize(validator, nil, signTxFn)
 
 	data, err := engine.validatorSetABI.Pack("distributeFinalityReward", make([]common.Address, 0), make([]*big.Int, 0))
 	if err != nil {
@@ -779,7 +790,12 @@ func TestParlia_applyTransactionModes(t *testing.T) {
 	}
 	expectedTx := func(stateDB *state.StateDB) *types.Transaction {
 		nonce := stateDB.GetNonce(msg.From)
-		return types.NewTransaction(nonce, *msg.To, msg.Value.ToBig(), msg.GasLimit, msg.GasPrice.ToBig(), msg.Data)
+		tx := types.NewTransaction(nonce, *msg.To, msg.Value.ToBig(), msg.GasLimit, msg.GasPrice.ToBig(), msg.Data)
+		signed, err := signTxFn(accounts.Account{Address: validator}, tx, config.ChainID)
+		if err != nil {
+			t.Fatalf("failed to sign system tx: %v", err)
+		}
+		return signed
 	}
 	apply := func(t *testing.T, stateDB *state.StateDB, receivedTxs *[]*types.Transaction, mode systemTxMode) ([]*types.Transaction, error) {
 		t.Helper()
@@ -800,6 +816,9 @@ func TestParlia_applyTransactionModes(t *testing.T) {
 		}
 		if isUnsignedTx(txs[0]) {
 			t.Fatalf("mining mode must sign system tx")
+		}
+		if from, err := types.Sender(types.LatestSigner(config), txs[0]); err != nil || from != validator {
+			t.Fatalf("system tx sender %s (%v), want %s", from, err, validator)
 		}
 	})
 
@@ -842,6 +861,38 @@ func TestParlia_applyTransactionModes(t *testing.T) {
 		}
 	})
 
+	t.Run("importing rejects an ECDSA system tx", func(t *testing.T) {
+		stateDB := newState(t)
+		expected := expectedTx(stateDB)
+		ecdsaKey, _ := crypto.GenerateKey()
+		legacy, err := types.SignTx(types.NewTransaction(expected.Nonce(), *expected.To(), expected.Value(), expected.Gas(), expected.GasPrice(), expected.Data()), types.LatestSigner(config), ecdsaKey)
+		if err != nil {
+			t.Fatalf("failed to sign legacy tx: %v", err)
+		}
+		receivedTxs := []*types.Transaction{legacy}
+		if _, err := apply(t, stateDB, &receivedTxs, systemTxImporting); !errors.Is(err, errPQSystemTx) {
+			t.Fatalf("expected errPQSystemTx, got %v", err)
+		}
+	})
+
+	t.Run("importing rejects a PQ system tx from another key", func(t *testing.T) {
+		stateDB := newState(t)
+		expected := expectedTx(stateDB)
+		otherKey, err := pq.GenerateKey()
+		if err != nil {
+			t.Fatalf("failed to generate key: %v", err)
+		}
+		other, _, otherSign := PQSignerFns(otherKey)
+		wrong, err := otherSign(accounts.Account{Address: other}, types.NewTransaction(expected.Nonce(), *expected.To(), expected.Value(), expected.Gas(), expected.GasPrice(), expected.Data()), config.ChainID)
+		if err != nil {
+			t.Fatalf("failed to sign system tx: %v", err)
+		}
+		receivedTxs := []*types.Transaction{wrong}
+		if _, err := apply(t, stateDB, &receivedTxs, systemTxImporting); !errors.Is(err, errPQSystemTx) {
+			t.Fatalf("expected errPQSystemTx, got %v", err)
+		}
+	})
+
 	t.Run("importing rejects missing received tx", func(t *testing.T) {
 		receivedTxs := []*types.Transaction{}
 		_, err := apply(t, newState(t), &receivedTxs, systemTxImporting)
@@ -853,9 +904,12 @@ func TestParlia_applyTransactionModes(t *testing.T) {
 	t.Run("importing rejects mismatched received tx", func(t *testing.T) {
 		stateDB := newState(t)
 		expected := expectedTx(stateDB)
-		wrongTx := types.NewTransaction(expected.Nonce()+1, *expected.To(), expected.Value(), expected.Gas(), expected.GasPrice(), expected.Data())
+		wrongTx, err := signTxFn(accounts.Account{Address: validator}, types.NewTransaction(expected.Nonce()+1, *expected.To(), expected.Value(), expected.Gas(), expected.GasPrice(), expected.Data()), config.ChainID)
+		if err != nil {
+			t.Fatalf("failed to sign system tx: %v", err)
+		}
 		receivedTxs := []*types.Transaction{wrongTx}
-		_, err := apply(t, stateDB, &receivedTxs, systemTxImporting)
+		_, err = apply(t, stateDB, &receivedTxs, systemTxImporting)
 		if err == nil || !strings.Contains(err.Error(), "expected tx hash") {
 			t.Fatalf("expected tx hash mismatch error, got %v", err)
 		}
@@ -863,6 +917,9 @@ func TestParlia_applyTransactionModes(t *testing.T) {
 }
 
 func isUnsignedTx(tx *types.Transaction) bool {
+	if _, _, sig, ok := tx.PQAuth(); ok {
+		return len(sig) == 0
+	}
 	v, r, s := tx.RawSignatureValues()
 	return v.Sign() == 0 && r.Sign() == 0 && s.Sign() == 0
 }
@@ -967,17 +1024,14 @@ func TestParliaFinalizeAndAssembleBidBlock(t *testing.T) {
 	rawdb.WriteBlock(db, parent)
 
 	engine := New(config, db, nil, genesisBlock.Hash())
-	validatorKey, err := crypto.GenerateKey()
+	// DashEVM: system transactions are ML-DSA-87 PQ transactions signed by the
+	// block producer, so the validator signs with the node's PQ signer.
+	validatorKey, err := pq.GenerateKey()
 	if err != nil {
 		t.Fatalf("failed to generate key: %v", err)
 	}
-	validator := crypto.PubkeyToAddress(validatorKey.PublicKey)
-	engine.Authorize(validator, nil, func(account accounts.Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) {
-		if account.Address != validator {
-			return nil, fmt.Errorf("unexpected signing account %s", account.Address)
-		}
-		return types.SignTx(tx, types.LatestSigner(config), validatorKey)
-	})
+	validator, _, signTxFn := PQSignerFns(validatorKey)
+	engine.Authorize(validator, nil, signTxFn)
 
 	gasFee := uint256.NewInt(12345)
 	newHeader := func() *types.Header {

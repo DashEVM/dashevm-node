@@ -7,8 +7,6 @@ import (
 
 	"github.com/cometbft/cometbft/types"
 	"github.com/cosmos/iavl"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tendermint/tendermint/crypto/merkle"
@@ -402,13 +400,14 @@ func TestCometBFTLightBlockValidateRejectsDuplicateTrustedValidatorsAtPasteur(t 
 	mutatedInput = append(mutatedInput, csBytes...)
 	mutatedInput = append(mutatedInput, blockBytes...)
 
-	pasteurPrecompile := ActivePrecompiledContracts(params.Rules{IsOsaka: true, IsMendel: true, IsPasteur: true})[common.BytesToAddress([]byte{0x67})]
+	// DashEVM disables 0x67 in every precompile set, so the upstream
+	// implementations are tested directly.
+	pasteurPrecompile := &cometBFTLightBlockValidatePasteur{}
 	_, err = pasteurPrecompile.Run(mutatedInput)
 	require.ErrorContains(t, err, "duplicate validator")
 
-	// IsInBSC so the pre-Pasteur set carries the BSC (0x67) precompile; without
-	// it the standard set is selected and 0x67 is absent.
-	legacyPrecompile := ActivePrecompiledContracts(params.Rules{IsOsaka: true, IsInBSC: true})[common.BytesToAddress([]byte{0x67})]
+	// The pre-Pasteur (Hertz) implementation accepts the duplicates.
+	legacyPrecompile := &cometBFTLightBlockValidateHertz{}
 	_, err = legacyPrecompile.Run(mutatedInput)
 	require.NoError(t, err)
 }

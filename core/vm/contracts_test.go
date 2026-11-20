@@ -69,7 +69,6 @@ var allPrecompiles = map[common.Address]PrecompiledContract{
 	common.BytesToAddress([]byte{0x0f, 0x0f}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x0f, 0x10}): &bls12381MapG2{},
 	common.BytesToAddress([]byte{102}):        &blsSignatureVerify{},
-	common.BytesToAddress([]byte{104}):        &verifyDoubleSignEvidence{},
 }
 
 // EIP-152 test vectors
@@ -368,7 +367,9 @@ func TestActivePrecompiledContractsUsesPasteurVariants(t *testing.T) {
 		return precompile
 	}
 
-	if got := requirePrecompile(0x67).Name(); got != "COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR" {
+	// DashEVM disables the classical signature precompiles in every set
+	// (contracts_finallayer.go), so the Pasteur slot holds the disabled stub.
+	if got := requirePrecompile(0x67).Name(); got != "DISABLED_COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR" {
 		t.Fatalf("unexpected Pasteur 0x67 precompile: %s", got)
 	}
 }
@@ -477,7 +478,17 @@ func TestDoubleSignSlash(t *testing.T) {
 		Name:     "",
 	}
 
-	testPrecompiled("68", tc, t)
+	// DashEVM: 0x68 is the ML-DSA double sign evidence precompile
+	// (pqDoubleSignEvidence, tested in contracts_finallayer_test.go). This
+	// upstream vector carries ECDSA-sealed headers, whose extra-data is shorter
+	// than an ML-DSA seal, so it is not evidence here.
+	active := ActivePrecompiledContracts(params.Rules{IsOsaka: true, IsMendel: true, IsPasteur: true})[common.BytesToAddress([]byte{0x68})]
+	if active == nil || active.Name() != "PQ_VERIFY_DOUBLE_SIGN_EVIDENCE" {
+		t.Fatalf("0x68 is not the PQ double sign evidence precompile")
+	}
+	if _, err := active.Run(common.Hex2Bytes(tc.Input)); err != errInvalidEvidence {
+		t.Fatalf("classical evidence: got %v, want %v", err, errInvalidEvidence)
+	}
 }
 
 func TestDoubleSignSlashFailure(t *testing.T) {
@@ -487,5 +498,9 @@ func TestDoubleSignSlashFailure(t *testing.T) {
 		Name:          "",
 	}
 
-	testPrecompiledFailure("68", tc, t)
+	// DashEVM: run the active 0x68 (pqDoubleSignEvidence), not the replaced BSC
+	// implementation.
+	if _, err := (&pqDoubleSignEvidence{}).Run(common.Hex2Bytes(tc.Input)); err == nil || err.Error() != tc.ExpectedError {
+		t.Fatalf("got %v, want %s", err, tc.ExpectedError)
+	}
 }
