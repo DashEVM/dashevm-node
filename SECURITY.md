@@ -1,22 +1,24 @@
 # Security Policy
 
-## Supported Versions
+DashEVM is beta software. The chain, the bridge and their contracts run on mainnet with real
+DASH under small limits, before their security audit.
 
-Please see [Releases](https://github.com/bnb-chain/bsc/releases). We recommend using the [most recently released version](https://github.com/bnb-chain/bsc/releases/latest).
+## Reporting a vulnerability
 
-## Audit reports
+Please do not open a public issue for a security problem.
 
-Audit reports are published in the `docs` folder: https://github.com/bnb-chain/bsc/tree/master/docs/audits
+Report it privately through GitHub: open the **Security** tab of the affected repository and
+choose **Report a vulnerability**. Include the affected component, the commit, and the steps
+or a proof of concept to reproduce it.
 
-| Scope  | Date     | Report Link                                                                                              |
-| ------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `geth` | 20170425 | [pdf](https://github.com/ethereum/go-ethereum/blob/master/docs/audits/2017-04-25_Geth-audit_Truesec.pdf) |
-| `clef` | 20180914 | [pdf](https://github.com/ethereum/go-ethereum/blob/master/docs/audits/2018-09-14_Clef-audit_NCC.pdf)     |
+We will acknowledge the report, keep you informed while we work on a fix, and credit you in
+the advisory unless you prefer otherwise.
 
-## Reporting a Vulnerability
+## Scope
 
-**Please do not file a public ticket** mentioning the vulnerability.
+- [dashevm-node](https://github.com/DashEVM/dashevm-node): the node client
+- [dashevm-genesis-contracts](https://github.com/DashEVM/dashevm-genesis-contracts): the system contracts
+- [dashevm-bridge](https://github.com/DashEVM/dashevm-bridge): the ICP canisters, the gateway contracts, the relayer and the bridge web app
 
-To find out how to disclose a vulnerability in Ethereum visit [https://bugcrowd.com/binance](https://bugcrowd.com/binance) or email bounty@ethereum.org. Please read the [disclosure page](https://github.com/bnb-chain/bsc/security/advisories) for more information about publicly disclosed security vulnerabilities.
-
-Use the built-in `geth version-check` feature to check whether the software is affected by any known vulnerability. This command will fetch the latest [`vulnerabilities.json`](https://geth.ethereum.org/docs/vulnerabilities/vulnerabilities.json) file which contains known security vulnerabilities concerning `geth`, and cross-check the data against its own version number.
+Vulnerabilities in upstream BSC or go-ethereum code that also affect those projects should be
+reported to them as well.

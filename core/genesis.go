@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/pq"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -443,6 +444,13 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 	if err := newCfg.CheckConfigForkOrder(); err != nil {
 		return nil, common.Hash{}, nil, err
 	}
+	// DashEVM / CardanoEVM launch guards are genesis settings: refuse to
+	// change them once the chain has blocks.
+	if head.Number.Uint64() != 0 {
+		if err := storedCfg.CheckParliaGuardsUnchanged(newCfg); err != nil {
+			return nil, common.Hash{}, nil, err
+		}
+	}
 
 	// TODO(rjl493456442) better to define the comparator of chain config
 	// and short circuit if the chain config is not changed.
@@ -626,6 +634,21 @@ func (g *Genesis) Commit(db ethdb.Database, triedb *triedb.Database, tracer *tra
 	}
 	if err := config.CheckConfigForkOrder(); err != nil {
 		return nil, err
+	}
+	// DashEVM / CardanoEVM: rotations store keys under the registry account. If that
+	// account is empty (no nonce, no code) EIP-158 deletes it, storage and
+	// all, at the end of every block, silently undoing each rotation. Require
+	// exactly nonce 1 and code 0xfe (INVALID) so no EVM code can write the
+	// registry either.
+	if config.Parlia != nil && params.IsBridgeChain(config.ChainID) {
+		if acc, ok := g.Alloc[pq.RegistryAddress]; !ok || acc.Nonce != 1 || !bytes.Equal(acc.Code, []byte{0xfe}) {
+			return nil, fmt.Errorf("genesis must allocate the PQ key registry %s with nonce 1 and code 0xfe", pq.RegistryAddress.Hex())
+		}
+		// The fee share BSC burns goes to the FeeVault (BSCValidatorSet.BURN_ADDRESS):
+		// without code there, the coins would be stranded at a keyless address.
+		if acc, ok := g.Alloc[params.BridgeFeeVaultAddress]; !ok || len(acc.Code) == 0 {
+			return nil, fmt.Errorf("genesis must allocate the FeeVault %s with code", params.BridgeFeeVaultAddress.Hex())
+		}
 	}
 	if config.Clique != nil && len(g.ExtraData) < 32+crypto.SignatureLength {
 		return nil, errors.New("can't start clique chain without signers")

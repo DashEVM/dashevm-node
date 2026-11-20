@@ -200,6 +200,11 @@ func (s *Snapshot) updateAttestation(header *types.Header, chainConfig *params.C
 	if !chainConfig.IsLuban(header.Number) {
 		return
 	}
+	// DashEVM: BLS vote attestations are never valid, so they never
+	// justify or finalize anything (verifySeal rejects any header carrying one).
+	if true {
+		return
+	}
 
 	// The attestation should have been checked in verify header, update directly
 	attestation, _ := getVoteAttestationFromHeader(header, chainConfig, s.EpochLength)
@@ -315,7 +320,7 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 			delete(snap.RecentForkHashes, number-limit)
 		}
 		// Resolve the authorization key and check against signers
-		validator, err := ecrecover(header, s.sigCache, chainConfig.ChainID)
+		validator, err := recoverSealer(header, s.sigCache, chainConfig.ChainID)
 		if err != nil {
 			return nil, err
 		}
@@ -576,6 +581,12 @@ func parseTurnLength(header *types.Header, chainConfig *params.ChainConfig, epoc
 		return nil, errInvalidTurnLength
 	}
 	turnLength := header.Extra[pos]
+	// DashEVM: the header byte feeds snapshot.apply (divisor) before
+	// Finalize compares it with the contract, so bound it here to the values
+	// BSCValidatorSet accepts (1 or 3..7).
+	if turnLength != 1 && (turnLength < 3 || turnLength > 7) {
+		return nil, errInvalidTurnLength
+	}
 	return &turnLength, nil
 }
 

@@ -19,6 +19,7 @@ package types
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -48,6 +49,13 @@ type txJSON struct {
 	R                    *hexutil.Big           `json:"r"`
 	S                    *hexutil.Big           `json:"s"`
 	YParity              *hexutil.Uint64        `json:"yParity,omitempty"`
+
+	// DashEVM post-quantum authorization:
+	From        *common.Address `json:"from,omitempty"`
+	PQScheme    *hexutil.Uint64 `json:"pqScheme,omitempty"`
+	PQPublicKey *hexutil.Bytes  `json:"pqPublicKey,omitempty"`
+	PQSignature *hexutil.Bytes  `json:"pqSignature,omitempty"`
+	FeeCurrency *common.Address `json:"feeCurrency,omitempty"`
 
 	// Blob transaction sidecar encoding:
 	Blobs       []kzg4844.Blob       `json:"blobs,omitempty"`
@@ -115,6 +123,26 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 		enc.S = (*hexutil.Big)(itx.S)
 		yparity := itx.V.Uint64()
 		enc.YParity = (*hexutil.Uint64)(&yparity)
+
+	case *PQTx:
+		enc.ChainID = (*hexutil.Big)(itx.ChainID)
+		enc.Nonce = (*hexutil.Uint64)(&itx.Nonce)
+		enc.To = tx.To()
+		enc.Gas = (*hexutil.Uint64)(&itx.Gas)
+		enc.MaxFeePerGas = (*hexutil.Big)(itx.GasFeeCap)
+		enc.MaxPriorityFeePerGas = (*hexutil.Big)(itx.GasTipCap)
+		enc.Value = (*hexutil.Big)(itx.Value)
+		enc.Input = (*hexutil.Bytes)(&itx.Data)
+		enc.AccessList = &itx.AccessList
+		from := itx.From
+		enc.From = &from
+		scheme := uint64(itx.Scheme)
+		enc.PQScheme = (*hexutil.Uint64)(&scheme)
+		enc.PQPublicKey = (*hexutil.Bytes)(&itx.PubKey)
+		enc.PQSignature = (*hexutil.Bytes)(&itx.Signature)
+		enc.FeeCurrency = copyAddressPtr(itx.FeeCurrency)
+		zero := new(big.Int)
+		enc.V, enc.R, enc.S = (*hexutil.Big)(zero), (*hexutil.Big)(zero), (*hexutil.Big)(zero)
 
 	case *DynamicFeeTx:
 		enc.ChainID = (*hexutil.Big)(itx.ChainID)
@@ -287,6 +315,50 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 				return err
 			}
 		}
+
+	case PQTxType:
+		var itx PQTx
+		inner = &itx
+		if dec.ChainID == nil {
+			return errors.New("missing required field 'chainId' in transaction")
+		}
+		itx.ChainID = (*big.Int)(dec.ChainID)
+		if dec.Nonce == nil {
+			return errors.New("missing required field 'nonce' in transaction")
+		}
+		itx.Nonce = uint64(*dec.Nonce)
+		itx.To = dec.To
+		if dec.Gas == nil {
+			return errors.New("missing required field 'gas' for txdata")
+		}
+		itx.Gas = uint64(*dec.Gas)
+		if dec.MaxPriorityFeePerGas == nil || dec.MaxFeePerGas == nil {
+			return errors.New("missing required fee fields in transaction")
+		}
+		itx.GasTipCap = (*big.Int)(dec.MaxPriorityFeePerGas)
+		itx.GasFeeCap = (*big.Int)(dec.MaxFeePerGas)
+		if dec.Value == nil {
+			return errors.New("missing required field 'value' in transaction")
+		}
+		itx.Value = (*big.Int)(dec.Value)
+		if dec.Input == nil {
+			return errors.New("missing required field 'input' in transaction")
+		}
+		itx.Data = *dec.Input
+		if dec.AccessList != nil {
+			itx.AccessList = *dec.AccessList
+		}
+		if dec.From == nil || dec.PQScheme == nil || dec.PQPublicKey == nil || dec.PQSignature == nil {
+			return errors.New("missing post-quantum authorization fields in transaction")
+		}
+		if *dec.PQScheme > math.MaxUint8 {
+			return errors.New("pqScheme does not fit in one byte")
+		}
+		itx.From = *dec.From
+		itx.Scheme = uint8(*dec.PQScheme)
+		itx.PubKey = *dec.PQPublicKey
+		itx.Signature = *dec.PQSignature
+		itx.FeeCurrency = dec.FeeCurrency
 
 	case DynamicFeeTxType:
 		var itx DynamicFeeTx

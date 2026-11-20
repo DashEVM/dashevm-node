@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -50,6 +51,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/core/vote"
+	"github.com/ethereum/go-ethereum/crypto/pq"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -487,10 +489,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		votePool := vote.NewVotePool(eth.blockchain, posa)
 		eth.votePool = votePool
 		if parlia, ok := eth.engine.(*parlia.Parlia); ok {
-			if !config.Miner.DisableVoteAttestation {
-				// if there is no VotePool in Parlia Engine, the miner can't get votes for assembling
-				parlia.VotePool = votePool
-			}
+			// DashEVM: BLS fast-finality votes are disabled, so the engine
+			// never receives a vote pool and never assembles attestations.
+			_ = parlia
 		} else {
 			return nil, errors.New("Engine is not Parlia type")
 		}
@@ -502,6 +503,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		}
 
 		if config.Miner.VoteEnable {
+			log.Warn("Final Layer: --vote is ignored, BLS fast finality votes are disabled")
+		}
+		if false {
 			conf := stack.Config()
 			blsPasswordPath := stack.ResolvePath(conf.BLSPasswordFile)
 			blsWalletPath := stack.ResolvePath(conf.BLSWalletDir)
@@ -672,19 +676,28 @@ func (s *Ethereum) updateNodeID(parlia *parlia.Parlia) error {
 		registeredSet[id] = struct{}{}
 	}
 
-	// Handle removals first
-	if err := s.handleRemovals(parlia, nonce, registeredSet); err != nil {
+	// Handle removals first; only a submitted removal consumes a nonce
+	removed, err := s.handleRemovals(parlia, nonce, registeredSet)
+	if err != nil {
 		return err
 	}
-	nonce++
+	if removed {
+		nonce++
+		// a wildcard removal clears every registered ID, so re-adds must not be
+		// filtered against the pre-removal set
+		if len(s.config.EVNNodeIDsToRemove) == 1 && s.config.EVNNodeIDsToRemove[0] == (enode.ID{}) {
+			registeredSet = map[enode.ID]struct{}{}
+		}
+	}
 
 	// Handle additions
 	return s.handleAdditions(parlia, nonce, registeredSet)
 }
 
-func (s *Ethereum) handleRemovals(parlia *parlia.Parlia, nonce uint64, registeredSet map[enode.ID]struct{}) error {
+// handleRemovals reports whether it submitted a removal transaction.
+func (s *Ethereum) handleRemovals(parlia *parlia.Parlia, nonce uint64, registeredSet map[enode.ID]struct{}) (bool, error) {
 	if len(s.config.EVNNodeIDsToRemove) == 0 {
-		return nil
+		return false, nil
 	}
 
 	// Handle wildcard removal
@@ -693,13 +706,13 @@ func (s *Ethereum) handleRemovals(parlia *parlia.Parlia, nonce uint64, registere
 		if s.config.EVNNodeIDsToRemove[0] == zeroID {
 			trx, err := parlia.RemoveNodeIDs([]enode.ID{}, nonce)
 			if err != nil {
-				return fmt.Errorf("failed to create node ID removal transaction: %v", err)
+				return false, fmt.Errorf("failed to create node ID removal transaction: %v", err)
 			}
-			if err := s.txPool.Add([]*types.Transaction{trx}, false); err != nil {
-				return fmt.Errorf("failed to add node ID removal transaction to pool: %v", err)
+			if errs := s.txPool.Add([]*types.Transaction{trx}, false); len(errs) > 0 && errs[0] != nil {
+				return false, fmt.Errorf("failed to add node ID removal transaction to pool: %v", errs)
 			}
 			log.Info("Submitted node ID removal transaction for all node IDs")
-			return nil
+			return true, nil
 		}
 	}
 
@@ -725,18 +738,18 @@ func (s *Ethereum) handleRemovals(parlia *parlia.Parlia, nonce uint64, registere
 
 	if len(nodeIDsToRemove) == 0 {
 		log.Debug("No node IDs to remove after filtering")
-		return nil
+		return false, nil
 	}
 
 	trx, err := parlia.RemoveNodeIDs(nodeIDsToRemove, nonce)
 	if err != nil {
-		return fmt.Errorf("failed to create node ID removal transaction: %v", err)
+		return false, fmt.Errorf("failed to create node ID removal transaction: %v", err)
 	}
 	if errs := s.txPool.Add([]*types.Transaction{trx}, false); len(errs) > 0 && errs[0] != nil {
-		return fmt.Errorf("failed to add node ID removal transaction to pool: %v", errs)
+		return false, fmt.Errorf("failed to add node ID removal transaction to pool: %v", errs)
 	}
 	log.Info("Submitted node ID removal transaction", "nodeIDs", nodeIDsToRemove)
-	return nil
+	return true, nil
 }
 
 func (s *Ethereum) handleAdditions(parlia *parlia.Parlia, nonce uint64, registeredSet map[enode.ID]struct{}) error {
@@ -787,12 +800,24 @@ func (s *Ethereum) StartMining() error {
 			return fmt.Errorf("etherbase missing: %v", err)
 		}
 		if parlia, ok := s.engine.(*parlia.Parlia); ok {
-			wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
-			if wallet == nil || err != nil {
-				log.Error("Etherbase account unavailable locally", "err", err)
-				return fmt.Errorf("signer missing: %v", err)
+			// DashEVM: validators sign with a post-quantum ML-DSA key file
+			// (path in FL_PQ_VALIDATOR_KEY). No ECDSA keystore is used.
+			keyPath := os.Getenv("FL_PQ_VALIDATOR_KEY")
+			key, err := pq.LoadKeyFile(keyPath)
+			if err != nil {
+				log.Error("Post-quantum validator key unavailable", "err", err)
+				return fmt.Errorf("pq validator key: %v", err)
 			}
-			parlia.Authorize(eb, wallet.SignData, wallet.SignTx)
+			if key.Address() != eb {
+				return fmt.Errorf("pq validator key address %v does not match etherbase %v", key.Address(), eb)
+			}
+			// DashEVM / CardanoEVM seal guard, kept next to the key (outside
+			// chaindata) so a restored database cannot reset it. Back it up
+			// and move it together with the key.
+			if err := parlia.EnableSealGuard(keyPath+".sealguard", s.blockchain.CurrentBlock().Number.Uint64()); err != nil {
+				return fmt.Errorf("seal guard: %v", err)
+			}
+			parlia.AuthorizePQ(key)
 
 			// Start a goroutine to handle node ID registration after sync
 			go func() {

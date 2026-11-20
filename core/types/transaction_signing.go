@@ -24,11 +24,18 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/pq"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/params/forks"
 )
 
 var ErrInvalidChainId = errors.New("invalid chain id for signer")
+
+// ErrClassicalSignatureDisabled is returned for a classical (secp256k1 ECDSA)
+// signature by an account that has locked itself to a post-quantum key (see
+// core.CheckClassicalAllowed). DashEVM and CardanoEVM accept ECDSA from every
+// other account.
+var ErrClassicalSignatureDisabled = errors.New("account is locked to a post-quantum key; classical (ECDSA) signatures are refused")
 
 // sigCache is used to cache the derived sender and contains
 // the signer used to derive it.
@@ -48,6 +55,11 @@ func MakeSigner(config *params.ChainConfig, blockNumber *big.Int, blockTime uint
 	case config.IsLondon(blockNumber):
 		signer = NewLondonSigner(config.ChainID)
 	case config.IsBerlin(blockNumber):
+		signer = NewEIP2930Signer(config.ChainID)
+	case config.ChainID != nil && config.ChainID.Sign() > 0:
+		// DashEVM: post-quantum transactions (including the system
+		// transactions of the first blocks) are valid from genesis, so a
+		// typed-transaction signer is used for every block.
 		signer = NewEIP2930Signer(config.ChainID)
 	case config.IsEIP155(blockNumber):
 		signer = NewEIP155Signer(config.ChainID)
@@ -76,7 +88,7 @@ func LatestSigner(config *params.ChainConfig) Signer {
 			signer = NewCancunSigner(config.ChainID)
 		case config.LondonBlock != nil:
 			signer = NewLondonSigner(config.ChainID)
-		case config.BerlinBlock != nil:
+		case config.BerlinBlock != nil, config.ChainID.Sign() > 0:
 			signer = NewEIP2930Signer(config.ChainID)
 		case config.EIP155Block != nil:
 			signer = NewEIP155Signer(config.ChainID)
@@ -218,6 +230,8 @@ func newModernSigner(chainID *big.Int, fork forks.Fork) Signer {
 		s.legacy = FrontierSigner{}
 	}
 	s.txtypes.set(LegacyTxType)
+	// DashEVM: the post-quantum transaction type is always supported.
+	s.txtypes.set(PQTxType)
 	// configure tx types
 	if fork >= forks.Berlin {
 		s.txtypes.set(AccessListTxType)
@@ -261,6 +275,9 @@ func (s *modernSigner) Sender(tx *Transaction) (common.Address, error) {
 	}
 	if tx.ChainId().Cmp(s.chainID) != 0 {
 		return common.Address{}, fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, tx.ChainId(), s.chainID)
+	}
+	if tt == PQTxType {
+		return pqSender(s.Hash(tx), tx)
 	}
 	// 'modern' txs are defined to use 0 and 1 as their recovery
 	// id, add 27 to become equivalent to unprotected Homestead signatures.
@@ -476,6 +493,22 @@ func decodeSignature(sig []byte) (r, s, v *big.Int, err error) {
 	return r, s, v, nil
 }
 
+// pqSender verifies the post-quantum signature of a PQ transaction against the
+// public key it carries and returns the claimed sender. The binding between
+// the sender account and the public key is checked against state by the
+// transaction pool and the state transition (see core.CheckPQAuthorization).
+func pqSender(sighash common.Hash, tx *Transaction) (common.Address, error) {
+	inner := tx.inner.(*PQTx)
+	if err := pq.Verify(pq.Scheme(inner.Scheme), pq.DomainTx, inner.PubKey, sighash[:], inner.Signature); err != nil {
+		return common.Address{}, fmt.Errorf("%w: %v", ErrInvalidSig, err)
+	}
+	return inner.From, nil
+}
+
+// recoverPlain recovers a classical (ECDSA) transaction sender. DashEVM and
+// CardanoEVM accept ECDSA; whether the recovered account is still allowed to
+// use it (not locked to a PQ key) is a state check done by the pool and the
+// state transition.
 func recoverPlain(sighash common.Hash, R, S, Vb *big.Int, homestead bool) (common.Address, error) {
 	if Vb.BitLen() > 8 {
 		return common.Address{}, ErrInvalidSig

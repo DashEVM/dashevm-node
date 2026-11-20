@@ -53,7 +53,10 @@ const (
 	// non-trivial consequences: larger transactions are significantly harder and
 	// more expensive to propagate; larger transactions also take more resources
 	// to validate whether they fit into the pool or not.
-	txMaxSize = 4 * txSlotSize // 128KB
+	//
+	// DashEVM / CardanoEVM: 512 KiB, so a bridge mint batch carrying k ML-DSA-87
+	// attestations (about 7.2 KB each) plus its deposits fits in one transaction.
+	txMaxSize = 16 * txSlotSize // 512KB
 )
 
 var (
@@ -300,7 +303,8 @@ func (pool *LegacyPool) Filter(tx *types.Transaction) bool {
 // FilterType returns whether the legacy pool supports the given transaction type.
 func (pool *LegacyPool) FilterType(kind byte) bool {
 	switch kind {
-	case types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType, types.SetCodeTxType:
+	case types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType, types.SetCodeTxType, types.PQTxType:
+		// DashEVM / CardanoEVM: ECDSA transactions are pooled next to PQ ones.
 		return true
 	default:
 		return false
@@ -554,6 +558,23 @@ func (pool *LegacyPool) Pending(filter txpool.PendingFilter) (map[common.Address
 // This check is meant as an early check which only needs to be performed once,
 // and does not require the pool mutex to be held.
 func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
+	// DashEVM: the stateless checks run first so a cheap rejection never
+	// pays for the ML-DSA verify; ValidateTransaction verifies the signature
+	// last, and the Sender call below is then a cache hit.
+	opts := &txpool.ValidationOptions{
+		Config: pool.chainconfig,
+		Accept: 0 |
+			1<<types.LegacyTxType |
+			1<<types.AccessListTxType |
+			1<<types.DynamicFeeTxType |
+			1<<types.SetCodeTxType |
+			1<<types.PQTxType,
+		MaxSize: txMaxSize,
+		MinTip:  pool.gasTip.Load().ToBig(),
+	}
+	if err := txpool.ValidateTransaction(tx, pool.currentHead.Load(), pool.signer, opts); err != nil {
+		return err
+	}
 	sender, err := types.Sender(pool.signer, tx)
 	if err != nil {
 		return err
@@ -564,18 +585,7 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 			return txpool.ErrInBlackList
 		}
 	}
-
-	opts := &txpool.ValidationOptions{
-		Config: pool.chainconfig,
-		Accept: 0 |
-			1<<types.LegacyTxType |
-			1<<types.AccessListTxType |
-			1<<types.DynamicFeeTxType |
-			1<<types.SetCodeTxType,
-		MaxSize: txMaxSize,
-		MinTip:  pool.gasTip.Load().ToBig(),
-	}
-	return txpool.ValidateTransaction(tx, pool.currentHead.Load(), pool.signer, opts)
+	return nil
 }
 
 // validateTx checks whether a transaction is valid according to the consensus
@@ -613,6 +623,9 @@ func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
 		},
 	}
 	if err := txpool.ValidateTransactionWithState(tx, pool.signer, opts); err != nil {
+		return err
+	}
+	if err := pool.validateFeeCurrency(tx, sender); err != nil {
 		return err
 	}
 	return pool.validateAuth(tx)
@@ -1261,6 +1274,7 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		}
 		// Reset from the old head to the new, rescheduling any reorged transactions
 		pool.reset(reset.oldHead, reset.newHead)
+		pool.dropRetiredPQKeys()
 
 		// Nonces were reset, discard any events that became stale
 		for addr := range events {
@@ -1560,6 +1574,56 @@ func (pool *LegacyPool) truncateQueue() {
 // Note: transactions are not marked as removed in the priced list because re-heaping
 // is always explicitly triggered by SetBaseFee and it would be unnecessary and wasteful
 // to trigger a re-heap is this function
+// dropRetiredPQKeys removes transactions signed by a key the account no longer
+// authorizes in the current state (DashEVM key rotation, review PQ-02).
+// Admission checks the key only once, so without this an old-key transaction
+// stays in the pool after a rotation, can never execute, and blocks the new
+// key's transaction at the same nonce as an underpriced replacement. A reorg
+// back to the old key drops new-key transactions the same way.
+func (pool *LegacyPool) dropRetiredPQKeys() {
+	var stale []common.Hash
+	pool.all.Range(func(hash common.Hash, tx *types.Transaction) bool {
+		from, err := types.Sender(pool.signer, tx)
+		if err != nil {
+			stale = append(stale, hash)
+			return true
+		}
+		if scheme, pk, ok := tx.PQKey(); ok {
+			if core.CheckPQAuthorization(pool.currentState, from, scheme, pk) != nil {
+				stale = append(stale, hash)
+			}
+		} else if core.CheckClassicalAllowed(pool.currentState, from) != nil {
+			// DashEVM / CardanoEVM: the account locked itself to a PQ key
+			// after this ECDSA transaction was pooled; it can never execute.
+			stale = append(stale, hash)
+			return true
+		}
+		return true
+	})
+	// An authorization by an account that has since locked is void; do not keep
+	// reserving that authority. Uses the pool's authority index (recovered once
+	// at admission), not a fresh ecrecover per authorization per head (see
+	// chain review 2, N-2: that let queued SetCode txs stall every head change).
+	pool.all.lock.RLock()
+	for authority, hashes := range pool.all.auths {
+		if core.CheckClassicalAllowed(pool.currentState, authority) != nil {
+			stale = append(stale, hashes...)
+		}
+	}
+	pool.all.lock.RUnlock()
+	seen := make(map[common.Hash]struct{}, len(stale))
+	for _, hash := range stale {
+		if _, dup := seen[hash]; dup {
+			continue
+		}
+		seen[hash] = struct{}{}
+		pool.removeTx(hash, true, true)
+	}
+	if len(stale) > 0 {
+		log.Debug("Dropped transactions signed by retired PQ keys", "count", len(stale))
+	}
+}
+
 func (pool *LegacyPool) demoteUnexecutables() {
 	// Iterate over all accounts and demote any non-executable transactions
 	gasLimit := pool.currentHead.Load().GasLimit
@@ -1575,6 +1639,17 @@ func (pool *LegacyPool) demoteUnexecutables() {
 		}
 		// Drop all transactions that are too costly (low balance or out of gas), and queue any invalids back for later
 		drops, invalids := list.Filter(pool.currentState.GetBalance(addr), gasLimit)
+		// DashEVM: drop a fee currency transaction the sender can no longer
+		// pay for (token balance spent, token delisted or price expired).
+		for _, tx := range list.Flatten() {
+			if tx.FeeCurrency() == nil || pool.checkFeeCurrencyState(tx, addr) == nil {
+				continue
+			}
+			if removed, invs := list.Remove(tx); removed {
+				drops = append(drops, tx)
+				invalids = append(invalids, invs...)
+			}
+		}
 		for _, tx := range drops {
 			hash := tx.Hash()
 			pool.all.Remove(hash)

@@ -30,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
+	"github.com/ethereum/go-ethereum/crypto/pq"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -224,6 +225,16 @@ type Message struct {
 	BlobHashes            []common.Hash
 	SetCodeAuthorizations []types.SetCodeAuthorization
 
+	// DashEVM post-quantum authorization. PQPubKey is non-nil exactly
+	// when the message comes from a PQ signed transaction; the key must be
+	// authorized for From (checked in preCheck).
+	PQScheme pq.Scheme
+	PQPubKey []byte
+
+	// FeeCurrency, when set, is the listed ERC-20 that pays for gas (prices
+	// stay in DASH wei and are converted at the directory rate).
+	FeeCurrency *common.Address
+
 	// When SkipNonceChecks is true, the message nonce is not checked against the
 	// account nonce in state.
 	//
@@ -288,6 +299,11 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 		BlobHashes:            tx.BlobHashes(),
 		BlobGasFeeCap:         blobGasFeeCap,
 	}
+	if scheme, pk, _, ok := tx.PQAuth(); ok {
+		msg.PQScheme = scheme
+		msg.PQPubKey = pk
+	}
+	msg.FeeCurrency = tx.FeeCurrency()
 	// If baseFee provided, set gasPrice to effectiveGasPrice.
 	if baseFee != nil {
 		effectiveGasPrice := new(big.Int).Add(baseFee, txGasTipCap)
@@ -347,6 +363,13 @@ type stateTransition struct {
 	gasRemaining  vm.GasBudget
 	state         vm.StateDB
 	evm           *vm.EVM
+
+	// Fee currency charge (only when msg.FeeCurrency is set).
+	feeInfo    *FeeCurrencyInfo
+	feeDebited *uint256.Int
+	// Storage refund counter growth caused by the token debit; excluded from
+	// the sender's refund (see buyGasInCurrency).
+	feeDebitRefund uint64
 }
 
 // newStateTransition initialises and returns a new state transition object.
@@ -368,6 +391,9 @@ func (st *stateTransition) to() common.Address {
 }
 
 func (st *stateTransition) buyGas() error {
+	if st.msg.FeeCurrency != nil {
+		return st.buyGasInCurrency()
+	}
 	mgval := new(uint256.Int).SetUint64(st.msg.GasLimit)
 	_, overflow := mgval.MulOverflow(mgval, st.msg.GasPrice)
 	if overflow {
@@ -433,6 +459,77 @@ func (st *stateTransition) buyGas() error {
 	return nil
 }
 
+// buyGasInCurrency is buyGas for a transaction paying gas in a fee currency:
+// the token is debited gasLimit * gasPrice converted at the directory rate,
+// and DASH pays only the value.
+func (st *stateTransition) buyGasInCurrency() error {
+	msg := st.msg
+	if len(msg.BlobHashes) > 0 {
+		return fmt.Errorf("%w: blob transactions cannot use a fee currency", ErrFeeCurrencyNotAllowed)
+	}
+	info, err := LookupFeeCurrency(st.evm, *msg.FeeCurrency)
+	if err != nil {
+		return err
+	}
+	mgval := new(uint256.Int).SetUint64(msg.GasLimit)
+	if _, overflow := mgval.MulOverflow(mgval, msg.GasPrice); overflow {
+		return fmt.Errorf("%w: address %v required balance exceeds 256 bits", ErrInsufficientFunds, msg.From.Hex())
+	}
+	debit, err := info.ToToken(mgval.ToBig())
+	if err != nil {
+		return err
+	}
+	if msg.Value != nil {
+		if have := st.state.GetBalance(msg.From); have.Cmp(msg.Value) < 0 {
+			return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, msg.From.Hex(), have, msg.Value)
+		}
+	}
+	if err := st.gp.SubGas(msg.GasLimit); err != nil {
+		return err
+	}
+	// Like any error after SubGas, a failed debit invalidates the transaction
+	// and the caller discards its state and gas pool changes.
+	refundBefore := st.state.GetRefund()
+	if err := debitFeeCurrency(st.evm, *msg.FeeCurrency, msg.From, debit, info.IntrinsicGas); err != nil {
+		return err
+	}
+	// Storage refunds earned inside the debit (the token clearing the sender's
+	// balance slot, for instance) are not the sender's to collect: the debit
+	// is paid for by the flat intrinsic gas, not metered against the sender.
+	// The counter itself is left alone (EIP-2200 may subtract the same refund
+	// again when the slot is refilled and must not go below zero); calcRefund
+	// excludes the amount instead.
+	if after := st.state.GetRefund(); after > refundBefore {
+		st.feeDebitRefund = after - refundBefore
+	}
+	if st.evm.Config.Tracer != nil && st.evm.Config.Tracer.OnGasChange != nil {
+		st.evm.Config.Tracer.OnGasChange(0, msg.GasLimit, tracing.GasChangeTxInitialBalance)
+	}
+	st.gasRemaining = vm.NewGasBudget(msg.GasLimit)
+	st.initialBudget = st.gasRemaining.Copy()
+	st.feeInfo = info
+	st.feeDebited = debit
+	return nil
+}
+
+// settleCurrencyFee credits the token back after execution: the fee for the
+// gas used to the block producer, the rest of the debit to the sender.
+func (st *stateTransition) settleCurrencyFee() error {
+	fee := new(big.Int).SetUint64(st.gasUsed())
+	fee.Mul(fee, st.msg.GasPrice.ToBig())
+	tokenFee, err := st.feeInfo.ToToken(fee)
+	if err != nil {
+		return err
+	}
+	if tokenFee.Gt(st.feeDebited) { // cannot happen: gasUsed <= gasLimit and rounding is monotonic
+		tokenFee = new(uint256.Int).Set(st.feeDebited)
+	}
+	refund := new(uint256.Int).Sub(st.feeDebited, tokenFee)
+	return creditFeeCurrency(st.evm, *st.msg.FeeCurrency,
+		[]common.Address{st.msg.From, st.evm.Context.Coinbase},
+		[]*uint256.Int{refund, tokenFee}, st.feeInfo.IntrinsicGas)
+}
+
 func (st *stateTransition) preCheck() error {
 	// Only check transactions that are not fake
 	msg := st.msg
@@ -448,6 +545,19 @@ func (st *stateTransition) preCheck() error {
 		} else if stNonce+1 < stNonce {
 			return fmt.Errorf("%w: address %v, nonce: %d", ErrNonceMax,
 				msg.From.Hex(), stNonce)
+		}
+	}
+	// DashEVM: the public key of a PQ transaction must be the key that
+	// currently controls the sender account (key registry or default address).
+	if msg.PQPubKey != nil {
+		if err := CheckPQAuthorization(st.state, msg.From, msg.PQScheme, msg.PQPubKey); err != nil {
+			return err
+		}
+	} else if !msg.SkipTransactionChecks {
+		// DashEVM / CardanoEVM: an ECDSA-signed message from an account locked
+		// to a PQ key is invalid (fake calls such as eth_call skip this).
+		if err := CheckClassicalAllowed(st.state, msg.From); err != nil {
+			return err
 		}
 	}
 	isOsaka := st.evm.ChainConfig().IsOsaka(st.evm.Context.BlockNumber, st.evm.Context.Time)
@@ -575,6 +685,21 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	// DashEVM: price the post-quantum public key and signature bytes.
+	if msg.PQPubKey != nil {
+		authGas := pq.AuthGas(msg.PQScheme)
+		if cost.RegularGas+authGas < cost.RegularGas {
+			return nil, ErrGasUintOverflow
+		}
+		cost.RegularGas += authGas
+	}
+	// DashEVM: a fee currency charges its intrinsic gas once.
+	if st.feeInfo != nil {
+		if cost.RegularGas+st.feeInfo.IntrinsicGas < cost.RegularGas {
+			return nil, ErrGasUintOverflow
+		}
+		cost.RegularGas += st.feeInfo.IntrinsicGas
+	}
 	prior, sufficient := st.gasRemaining.Charge(cost)
 	if !sufficient {
 		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gasRemaining.RegularGas, cost.RegularGas)
@@ -649,8 +774,23 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 			st.state.AddAddressToAccessList(addr)
 		}
 
-		// Execute the transaction's call.
-		ret, st.gasRemaining, vmerr = st.evm.Call(msg.From, st.to(), msg.Data, st.gasRemaining, value)
+		// Execute the transaction's call. A PQ transaction addressed to the key
+		// registry is a key rotation and is handled natively.
+		// DashEVM / CardanoEVM: an ECDSA account may also send it, once: it
+		// registers the account's first PQ key and locks the account to PQ.
+		if *msg.To == pq.RegistryAddress {
+			// Native operations must emit a top-level call frame for tracers.
+			startGas := st.gasRemaining.RegularGas
+			if hooks := st.evm.Config.Tracer; hooks != nil && hooks.OnEnter != nil {
+				hooks.OnEnter(0, byte(vm.CALL), msg.From, *msg.To, msg.Data, startGas, value.ToBig())
+			}
+			vmerr = st.applyPQRotation()
+			if hooks := st.evm.Config.Tracer; hooks != nil && hooks.OnExit != nil {
+				hooks.OnExit(0, nil, startGas-st.gasRemaining.RegularGas, vm.VMErrorFromErr(vmerr), vmerr != nil)
+			}
+		} else {
+			ret, st.gasRemaining, vmerr = st.evm.Call(msg.From, st.to(), msg.Data, st.gasRemaining, value)
+		}
 	}
 
 	// Record the gas used excluding gas refunds. This value represents the actual
@@ -697,8 +837,12 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 
 	fee := new(uint256.Int).SetUint64(st.gasUsed())
 	fee.Mul(fee, effectiveTip)
-	// consensus engine is parlia
-	if st.evm.ChainConfig().IsInBSC() {
+	if st.feeInfo != nil {
+		// DashEVM: gas was paid in a fee currency (refund + fee in the token).
+		if err := st.settleCurrencyFee(); err != nil {
+			return nil, err
+		}
+	} else if st.evm.ChainConfig().IsInBSC() {
 		st.state.AddBalance(consensus.SystemAddress, fee, tracing.BalanceIncreaseRewardTransactionFee)
 		// add extra blob fee reward
 		if rules.IsCancun {
@@ -752,6 +896,10 @@ func (st *stateTransition) validateAuthorization(auth *types.SetCodeAuthorizatio
 	//
 	// Note it is added to the access list even if the authorization is invalid.
 	st.state.AddAddressToAccessList(authority)
+	// DashEVM / CardanoEVM: a PQ-locked account's ECDSA authorization is void.
+	if err := CheckClassicalAllowed(st.state, authority); err != nil {
+		return authority, err
+	}
 	code := st.state.GetCode(authority)
 	if _, ok := types.ParseDelegation(code); len(code) != 0 && !ok {
 		return authority, ErrAuthorizationDestinationHasCode
@@ -799,8 +947,17 @@ func (st *stateTransition) calcRefund() vm.GasBudget {
 		// After EIP-3529: refunds are capped to gasUsed / 5
 		refund = st.gasUsed() / params.RefundQuotientEIP3529
 	}
-	if refund > st.state.GetRefund() {
-		refund = st.state.GetRefund()
+	// DashEVM: refunds earned by the fee currency debit are not the
+	// sender's (clamped: the counter may since have been reduced by EIP-2200
+	// when the cleared slot was refilled).
+	earned := st.state.GetRefund()
+	if earned >= st.feeDebitRefund {
+		earned -= st.feeDebitRefund
+	} else {
+		earned = 0
+	}
+	if refund > earned {
+		refund = earned
 	}
 	if st.evm.Config.Tracer != nil && st.evm.Config.Tracer.OnGasChange != nil && refund > 0 {
 		st.evm.Config.Tracer.OnGasChange(st.gasRemaining.RegularGas, st.gasRemaining.RegularGas+refund, tracing.GasChangeTxRefunds)
@@ -811,6 +968,9 @@ func (st *stateTransition) calcRefund() vm.GasBudget {
 // returnGas returns ETH for remaining gas,
 // exchanged at the original rate.
 func (st *stateTransition) returnGas() {
+	if st.feeInfo != nil {
+		return // refunded in the token by settleCurrencyFee
+	}
 	remaining := uint256.NewInt(st.gasRemaining.RegularGas)
 	remaining.Mul(remaining, st.msg.GasPrice)
 	st.state.AddBalance(st.msg.From, remaining, tracing.BalanceIncreaseGasReturn)

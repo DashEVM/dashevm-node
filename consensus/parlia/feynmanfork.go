@@ -113,6 +113,16 @@ func (p *Parlia) updateValidatorSetV2(state vm.StateDB, header *types.Header, ch
 	// 2. sort by voting power
 	eValidators, eVotingPowers, eVoteAddrs := getTopValidatorsByVotingPower(validatorItems, maxElectedValidators)
 
+	// DashEVM: with no eligible validator registered in StakeHub (e.g. a
+	// new genesis before its validators have registered) the election is
+	// empty, and BSCValidatorSet.updateValidatorSetV2 fails on an empty set,
+	// so no breathe block could be built: a permanent halt. Keep the current
+	// set instead. Producer and importer decide from the same parent state.
+	if len(eValidators) == 0 {
+		log.Warn("Empty validator election, keeping the current validator set", "number", header.Number)
+		return nil
+	}
+
 	// 3. update validator set to system contract
 	method := "updateValidatorSetV2"
 	data, err := p.validatorSetABI.Pack(method, eValidators, eVotingPowers, eVoteAddrs)
@@ -127,6 +137,50 @@ func (p *Parlia) updateValidatorSetV2(state vm.StateDB, header *types.Header, ch
 	return p.applyTransaction(msg, state, header, chain, txs, receipts, receivedTxs, usedGas, mode, tracer)
 }
 
+// electionInfoPageSize bounds the number of validators read per
+// getValidatorElectionInfo call (~95k gas each in StakeHub), keeping every
+// eth_call far below the RPC gas cap no matter how many validators register.
+const electionInfoPageSize = 100
+
+// electionInfoFetcher reads one page of StakeHub.getValidatorElectionInfo.
+type electionInfoFetcher func(offset, limit uint64) ([]common.Address, []*big.Int, [][]byte, uint64, error)
+
+// collectValidatorElectionInfo reads the full validator list page by page.
+// The result is identical (same order) to a single unpaginated call.
+func collectValidatorElectionInfo(fetch electionInfoFetcher) ([]ValidatorItem, error) {
+	var validatorItems []ValidatorItem
+	for offset := uint64(0); ; {
+		validators, votingPowers, voteAddrs, total, err := fetch(offset, electionInfoPageSize)
+		if err != nil {
+			return nil, err
+		}
+		if offset >= total {
+			if offset != total {
+				return nil, errors.New("validator length not match")
+			}
+			return validatorItems, nil
+		}
+		want := total - offset
+		if want > electionInfoPageSize {
+			want = electionInfoPageSize
+		}
+		if uint64(len(validators)) != want || len(votingPowers) != len(validators) || len(voteAddrs) != len(validators) {
+			return nil, errors.New("validator length not match")
+		}
+		for i := range validators {
+			validatorItems = append(validatorItems, ValidatorItem{
+				address:     validators[i],
+				votingPower: votingPowers[i],
+				voteAddress: voteAddrs[i],
+			})
+		}
+		offset += want
+		if offset == total {
+			return validatorItems, nil
+		}
+	}
+}
+
 func (p *Parlia) getValidatorElectionInfo(blockNr rpc.BlockNumberOrHash) ([]ValidatorItem, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -135,43 +189,38 @@ func (p *Parlia) getValidatorElectionInfo(blockNr rpc.BlockNumberOrHash) ([]Vali
 	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
 
-	data, err := p.stakeHubABI.Pack(method, big.NewInt(0), big.NewInt(0))
-	if err != nil {
-		log.Error("Unable to pack tx for getValidatorElectionInfo", "error", err)
-		return nil, err
-	}
-	msgData := (hexutil.Bytes)(data)
-
-	result, err := p.ethAPI.Call(ctx, ethapi.TransactionArgs{
-		Gas:  &gas,
-		To:   &toAddress,
-		Data: &msgData,
-	}, &blockNr, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	var validators []common.Address
-	var votingPowers []*big.Int
-	var voteAddrs [][]byte
-	var totalLength *big.Int
-	if err := p.stakeHubABI.UnpackIntoInterface(&[]interface{}{&validators, &votingPowers, &voteAddrs, &totalLength}, method, result); err != nil {
-		return nil, err
-	}
-	if totalLength.Int64() != int64(len(validators)) || totalLength.Int64() != int64(len(votingPowers)) || totalLength.Int64() != int64(len(voteAddrs)) {
-		return nil, errors.New("validator length not match")
-	}
-
-	validatorItems := make([]ValidatorItem, len(validators))
-	for i := 0; i < len(validators); i++ {
-		validatorItems[i] = ValidatorItem{
-			address:     validators[i],
-			votingPower: votingPowers[i],
-			voteAddress: voteAddrs[i],
+	// DashEVM: read the validator list in pages. Registering a validator is
+	// permissionless, and a single call over every registered validator runs
+	// out of gas at the RPC gas cap, failing every breathe block on every node.
+	return collectValidatorElectionInfo(func(offset, limit uint64) ([]common.Address, []*big.Int, [][]byte, uint64, error) {
+		data, err := p.stakeHubABI.Pack(method, new(big.Int).SetUint64(offset), new(big.Int).SetUint64(limit))
+		if err != nil {
+			log.Error("Unable to pack tx for getValidatorElectionInfo", "error", err)
+			return nil, nil, nil, 0, err
 		}
-	}
+		msgData := (hexutil.Bytes)(data)
 
-	return validatorItems, nil
+		result, err := ethapi.ConsensusCall(ctx, p.ethAPI, ethapi.TransactionArgs{
+			Gas:  &gas,
+			To:   &toAddress,
+			Data: &msgData,
+		}, &blockNr)
+		if err != nil {
+			return nil, nil, nil, 0, err
+		}
+
+		var validators []common.Address
+		var votingPowers []*big.Int
+		var voteAddrs [][]byte
+		var totalLength *big.Int
+		if err := p.stakeHubABI.UnpackIntoInterface(&[]interface{}{&validators, &votingPowers, &voteAddrs, &totalLength}, method, result); err != nil {
+			return nil, nil, nil, 0, err
+		}
+		if !totalLength.IsUint64() {
+			return nil, nil, nil, 0, errors.New("validator length not match")
+		}
+		return validators, votingPowers, voteAddrs, totalLength.Uint64(), nil
+	})
 }
 
 func (p *Parlia) getMaxElectedValidators(blockNr rpc.BlockNumberOrHash) (maxElectedValidators *big.Int, err error) {
@@ -189,11 +238,11 @@ func (p *Parlia) getMaxElectedValidators(blockNr rpc.BlockNumberOrHash) (maxElec
 	}
 	msgData := (hexutil.Bytes)(data)
 
-	result, err := p.ethAPI.Call(ctx, ethapi.TransactionArgs{
+	result, err := ethapi.ConsensusCall(ctx, p.ethAPI, ethapi.TransactionArgs{
 		Gas:  &gas,
 		To:   &toAddress,
 		Data: &msgData,
-	}, &blockNr, nil, nil)
+	}, &blockNr)
 	if err != nil {
 		return nil, err
 	}

@@ -446,6 +446,7 @@ var (
 )
 
 func init() {
+	applyFinalLayerPrecompilePolicy()
 	for k := range PrecompiledContractsHomestead {
 		PrecompiledAddressesHomestead = append(PrecompiledAddressesHomestead, k)
 	}
@@ -509,6 +510,14 @@ func init() {
 }
 
 func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
+	base := basePrecompiledContracts(rules)
+	if rules.IsSealEvidence {
+		return withSealEvidence(base)
+	}
+	return base
+}
+
+func basePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 	switch {
 	case rules.IsUBT:
 		return PrecompiledContractsVerkle
@@ -566,6 +575,14 @@ func ActivePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 
 // ActivePrecompiles returns the precompile addresses enabled with the current configuration.
 func ActivePrecompiles(rules params.Rules) []common.Address {
+	base := basePrecompiles(rules)
+	if rules.IsSealEvidence {
+		return append(append(make([]common.Address, 0, len(base)+1), base...), PQConflictingSealEvidenceAddress)
+	}
+	return base
+}
+
+func basePrecompiles(rules params.Rules) []common.Address {
 	switch {
 	case rules.IsPasteur:
 		return PrecompiledAddressesPasteur

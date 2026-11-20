@@ -45,6 +45,10 @@ type (
 
 func (evm *EVM) precompile(addr common.Address) (PrecompiledContract, bool) {
 	p, ok := evm.precompiles[addr]
+	// DashEVM / CardanoEVM: ecrecover refuses accounts locked to a PQ key.
+	if ok && addr == ecrecoverAddress && evm.StateDB != nil {
+		return &pqLockedEcrecover{inner: p, state: evm.StateDB}, true
+	}
 	return p, ok
 }
 

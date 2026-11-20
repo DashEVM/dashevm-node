@@ -45,6 +45,7 @@ import (
 	buildertypes "github.com/ethereum/go-ethereum/core/types/builder"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/pq"
 	"github.com/ethereum/go-ethereum/eth/gasestimator"
 	"github.com/ethereum/go-ethereum/eth/tracers/logger"
 	"github.com/ethereum/go-ethereum/internal/ethapi/override"
@@ -1667,6 +1668,13 @@ type RPCTransaction struct {
 	R                   *hexutil.Big                 `json:"r"`
 	S                   *hexutil.Big                 `json:"s"`
 	YParity             *hexutil.Uint64              `json:"yParity,omitempty"`
+
+	// DashEVM post-quantum authorization (PQ transactions only).
+	PQScheme    *hexutil.Uint64 `json:"pqScheme,omitempty"`
+	PQAlgorithm string          `json:"pqAlgorithm,omitempty"`
+	PQPublicKey hexutil.Bytes   `json:"pqPublicKey,omitempty"`
+	PQSignature hexutil.Bytes   `json:"pqSignature,omitempty"`
+	FeeCurrency *common.Address `json:"feeCurrency,omitempty"`
 }
 
 // newRPCTransaction returns a transaction that will serialize to the RPC
@@ -1697,6 +1705,28 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 	}
 
 	switch tx.Type() {
+	case types.PQTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		if baseFee != nil && blockHash != (common.Hash{}) {
+			result.GasPrice = (*hexutil.Big)(effectiveGasPrice(tx, baseFee))
+		} else {
+			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
+		}
+		if claimed, ok := tx.PQFrom(); ok && from == (common.Address{}) {
+			result.From = claimed
+		}
+		scheme, pk, sig, _ := tx.PQAuth()
+		sch := hexutil.Uint64(scheme)
+		result.PQScheme = &sch
+		result.PQAlgorithm = pq.Name(scheme)
+		result.PQPublicKey = pk
+		result.PQSignature = sig
+		result.FeeCurrency = tx.FeeCurrency()
+
 	case types.LegacyTxType:
 		// if a legacy transaction has an EIP-155 chain id, include it explicitly
 		if id := tx.ChainId(); id.Sign() != 0 {
@@ -2160,8 +2190,12 @@ func (api *TransactionAPI) GetRawTransactionByHash(ctx context.Context, hash com
 
 // GetTransactionReceiptsByBlockNumber returns the transaction receipts for the given block number.
 func (api *TransactionAPI) GetTransactionReceiptsByBlockNumber(ctx context.Context, blockNr rpc.BlockNumber) ([]map[string]interface{}, error) {
-	blockNumber := uint64(blockNr.Int64())
-	blockHash := rawdb.ReadCanonicalHash(api.b.ChainDb(), blockNumber)
+	// resolve tags such as "latest" instead of casting them to huge numbers
+	header, err := api.b.HeaderByNumber(ctx, blockNr)
+	if err != nil || header == nil {
+		return nil, fmt.Errorf("block %v not found", blockNr)
+	}
+	blockNumber, blockHash := header.Number.Uint64(), header.Hash()
 
 	receipts, err := api.b.GetReceipts(ctx, blockHash)
 	if err != nil {
@@ -2258,12 +2292,21 @@ func (api *TransactionAPI) GetTransactionDataAndReceipt(ctx context.Context, has
 		"hash":             rpcTransaction.Hash.String(),
 		"input":            rpcTransaction.Input.String(),
 		"nonce":            rpcTransaction.Nonce.String(),
-		"to":               rpcTransaction.To.String(),
+		"to":               nil, // contract creation
 		"transactionIndex": rpcTransaction.TransactionIndex.String(),
 		"value":            rpcTransaction.Value.String(),
 		"v":                rpcTransaction.V.String(),
 		"r":                rpcTransaction.R.String(),
 		"s":                rpcTransaction.S.String(),
+	}
+	if rpcTransaction.To != nil {
+		txData["to"] = rpcTransaction.To.String()
+	}
+	if rpcTransaction.PQScheme != nil {
+		txData["pqScheme"] = rpcTransaction.PQScheme.String()
+		txData["pqAlgorithm"] = rpcTransaction.PQAlgorithm
+		txData["pqPublicKey"] = rpcTransaction.PQPublicKey.String()
+		txData["pqSignature"] = rpcTransaction.PQSignature.String()
 	}
 
 	result := map[string]interface{}{

@@ -27,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
+	"github.com/ethereum/go-ethereum/crypto/pq"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
@@ -60,6 +61,11 @@ type ValidationFunction func(tx *types.Transaction, head *types.Header, signer t
 // This check is public to allow different transaction pools to check the basic
 // rules without duplicating code and running the risk of missed updates.
 func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types.Signer, opts *ValidationOptions) error {
+	// DashEVM / CardanoEVM: no blob transactions (nothing uses them, and the
+	// blob pool has no PQ-lock eviction).
+	if tx.Type() == types.BlobTxType {
+		return fmt.Errorf("%w: blob transactions are not accepted on this chain", core.ErrTxTypeNotSupported)
+	}
 	// Ensure transactions not implemented by the calling pool are rejected
 	if opts.Accept&(1<<tx.Type()) == 0 {
 		return fmt.Errorf("%w: tx type %v not supported by this pool", core.ErrTxTypeNotSupported, tx.Type())
@@ -116,10 +122,6 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if tx.GasFeeCapIntCmp(tx.GasTipCap()) < 0 {
 		return core.ErrTipAboveFeeCap
 	}
-	// Make sure the transaction is signed properly
-	if _, err := types.Sender(signer, tx); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidSender, err)
-	}
 	// Limit nonce to 2^64-1 per EIP-2681
 	if tx.Nonce()+1 < tx.Nonce() {
 		return core.ErrNonceMax
@@ -129,6 +131,9 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, true, rules.IsIstanbul, rules.IsShanghai, rules.IsAmsterdam)
 	if err != nil {
 		return err
+	}
+	if scheme, _, _, ok := tx.PQAuth(); ok {
+		intrGas.RegularGas += pq.AuthGas(scheme)
 	}
 	if tx.Gas() < intrGas.RegularGas {
 		return fmt.Errorf("%w: gas %v, minimum needed %v", core.ErrIntrinsicGas, tx.Gas(), intrGas.RegularGas)
@@ -146,6 +151,11 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	// Ensure the gasprice is high enough to cover the requirement of the calling pool
 	if tx.GasTipCapIntCmp(opts.MinTip) < 0 {
 		return fmt.Errorf("%w: gas tip cap %v, minimum needed %v", ErrTxGasPriceTooLow, tx.GasTipCap(), opts.MinTip)
+	}
+	// Make sure the transaction is signed properly. DashEVM: the ML-DSA
+	// verify costs about 200us, so it runs after every cheap stateless check.
+	if _, err := types.Sender(signer, tx); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSender, err)
 	}
 	if tx.Type() == types.BlobTxType {
 		return ValidateBlobTx(tx, head, opts)
@@ -259,6 +269,23 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 	if err != nil {
 		log.Error("Transaction sender recovery failed", "err", err)
 		return err
+	}
+	// DashEVM: the carried public key must currently control the sender.
+	if scheme, pk, _, ok := tx.PQAuth(); ok {
+		if err := core.CheckPQAuthorization(opts.State, from, scheme, pk); err != nil {
+			return err
+		}
+	} else if err := core.CheckClassicalAllowed(opts.State, from); err != nil {
+		return err
+	}
+	// EIP-7702 authorizations signed by a PQ-locked account are refused
+	// (consensus skips them; the pool does not carry them).
+	for _, auth := range tx.SetCodeAuthorizations() {
+		if authority, err := auth.Authority(); err == nil {
+			if err := core.CheckClassicalAllowed(opts.State, authority); err != nil {
+				return err
+			}
+		}
 	}
 	next := opts.State.GetNonce(from)
 	if next > tx.Nonce() {

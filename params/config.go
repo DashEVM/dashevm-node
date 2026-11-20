@@ -794,7 +794,82 @@ func (c CliqueConfig) String() string {
 }
 
 // ParliaConfig is the consensus engine configs for proof-of-staked-authority based sealing.
+//
+// DashEVM / CardanoEVM launch guards (ICP-SPEC section 3). They are genesis
+// settings: nil keeps the rule off (every chain built before them), and they
+// are not part of the fork id or the compatibility check, so never change them
+// on a running chain.
 type ParliaConfig struct {
+	// ChurnCapBlock: from this block on, the validator set written into each
+	// epoch block differs from the previous epoch set by at most
+	// max(1, floor(N/6)) additions and at most as many removals (N = previous
+	// set size), exactly the ICP light client's churn cap. Validators the
+	// system contract no longer lists stay in the set (pending removal, they
+	// simply miss their turns) until the cap lets them go.
+	ChurnCapBlock *big.Int `json:"churnCapBlock,omitempty"`
+	// RemovalBitmapBlock: from this block on (needs ChurnCapBlock at or
+	// before it), each epoch Extra carries the pendingRemovals bitmap right
+	// after turnLength. Off until the ICP light client parses it.
+	RemovalBitmapBlock *big.Int `json:"removalBitmapBlock,omitempty"`
+	// SealEvidenceBlock: from this block on, the conflicting seal evidence
+	// precompile (0x0f02) is active (SlashIndicator.submitConflictingSealEvidence).
+	SealEvidenceBlock *big.Int `json:"sealEvidenceBlock,omitempty"`
+}
+
+func parliaGuardActive(at *big.Int, num *big.Int) bool {
+	return at != nil && num != nil && num.Sign() > 0 && num.Cmp(at) >= 0
+}
+
+// CheckParliaGuardsUnchanged refuses a new configuration whose launch guards
+// differ from the stored one. They are genesis settings: a node whose guards
+// differ from the network's forks at the first epoch block, so an initialized
+// chain must keep them (chain-guard review M-2). Not part of
+// CheckCompatible, which would answer with a rewind instead of a refusal.
+func (c *ChainConfig) CheckParliaGuardsUnchanged(newcfg *ChainConfig) error {
+	var oldG, newG ParliaConfig
+	if c != nil && c.Parlia != nil {
+		oldG = *c.Parlia
+	}
+	if newcfg != nil && newcfg.Parlia != nil {
+		newG = *newcfg.Parlia
+	}
+	same := func(a, b *big.Int) bool {
+		if a == nil || b == nil {
+			return a == nil && b == nil
+		}
+		return a.Cmp(b) == 0
+	}
+	for _, f := range []struct {
+		name     string
+		old, new *big.Int
+	}{
+		{"churnCapBlock", oldG.ChurnCapBlock, newG.ChurnCapBlock},
+		{"removalBitmapBlock", oldG.RemovalBitmapBlock, newG.RemovalBitmapBlock},
+		{"sealEvidenceBlock", oldG.SealEvidenceBlock, newG.SealEvidenceBlock},
+	} {
+		if !same(f.old, f.new) {
+			return fmt.Errorf("parlia %s cannot change on an initialized chain (stored %v, new %v): it is a genesis setting", f.name, f.old, f.new)
+		}
+	}
+	return nil
+}
+
+// IsChurnCap reports whether the epoch churn cap applies to block num (never
+// to the genesis block, whose set is the starting point).
+func (c *ChainConfig) IsChurnCap(num *big.Int) bool {
+	return c.Parlia != nil && parliaGuardActive(c.Parlia.ChurnCapBlock, num)
+}
+
+// IsRemovalBitmap reports whether epoch block num carries the pendingRemovals
+// bitmap (never the genesis block).
+func (c *ChainConfig) IsRemovalBitmap(num *big.Int) bool {
+	return c.Parlia != nil && c.IsChurnCap(num) && parliaGuardActive(c.Parlia.RemovalBitmapBlock, num)
+}
+
+// IsSealEvidence reports whether the conflicting seal evidence precompile is
+// active at block num.
+func (c *ChainConfig) IsSealEvidence(num *big.Int) bool {
+	return c.Parlia != nil && parliaGuardActive(c.Parlia.SealEvidenceBlock, num)
 }
 
 // String implements the stringer interface, returning the consensus engine details.
@@ -1544,6 +1619,13 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 	if c.IsNotInBSC() {
 		return nil
 	}
+	// DashEVM / CardanoEVM: the pendingRemovals bitmap lists validators kept by
+	// the churn cap, so it needs the cap.
+	if rb := c.Parlia.RemovalBitmapBlock; rb != nil {
+		if cc := c.Parlia.ChurnCapBlock; cc == nil || cc.Cmp(rb) > 0 {
+			return errors.New("invalid parlia config: removalBitmapBlock needs churnCapBlock at or before it")
+		}
+	}
 	type fork struct {
 		name      string
 		block     *big.Int // forks up to - and including the merge - were defined with block numbers
@@ -2123,6 +2205,9 @@ type Rules struct {
 	IsBohr, IsPascal, IsPrague, IsLorentz, IsMaxwell        bool
 	IsFermi, IsOsaka, IsMendel                              bool
 	IsPasteur, IsAmsterdam, IsUBT                           bool
+	// IsSealEvidence enables the DashEVM / CardanoEVM conflicting seal
+	// evidence precompile (ParliaConfig.SealEvidenceBlock).
+	IsSealEvidence bool
 	// IsInBSC is true when Parlia is configured (BSC chains). core/vm uses it to
 	// select the BSC precompile set (…ForBSC); non-BSC chains (e.g. the standard
 	// state / execution-spec tests) get the standard upstream set.
@@ -2172,5 +2257,6 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsUBT:            isUBT,
 		IsEIP4762:        isUBT,
 		IsInBSC:          c.IsInBSC(),
+		IsSealEvidence:   c.IsSealEvidence(num),
 	}
 }

@@ -73,6 +73,7 @@ const (
 )
 
 var (
+	errSystemLikePoolTx = errors.New("pool transaction would be a system transaction")
 	bidExistGauge        = metrics.NewRegisteredGauge("worker/bidExist", nil)
 	bidWinGauge          = metrics.NewRegisteredGauge("worker/bidWin", nil)
 	inturnBlocksGauge    = metrics.NewRegisteredGauge("worker/inturnBlocks", nil)
@@ -117,6 +118,7 @@ type environment struct {
 	state    *state.StateDB // apply state changes here
 	tcount   int            // tx count in cycle
 	size     uint64         // size of the block we are building
+	sizeCap  uint64         // transactions are added while size stays below this
 	gasPool  *core.GasPool  // available gas used to pack transactions
 	coinbase common.Address
 	evm      *vm.EVM
@@ -164,7 +166,11 @@ type task struct {
 
 // txFitsSize reports whether the transaction fits into the block size limit.
 func (env *environment) txFitsSize(tx *types.Transaction) bool {
-	return env.size+tx.Size() < params.MaxBlockSize-maxBlockSizeBufferZone
+	limit := uint64(params.MaxBlockSize - maxBlockSizeBufferZone)
+	if env.sizeCap != 0 {
+		limit = env.sizeCap
+	}
+	return env.size+tx.Size() < limit
 }
 
 const (
@@ -180,6 +186,34 @@ const (
 // try to say below the size including a buffer zone, this is to avoid going over the
 // maximum size with auxiliary data added into the block.
 const maxBlockSizeBufferZone = 1_000_000
+
+// finalLayerSizeCap is the size the miner fills DashEVM (Parlia) blocks
+// up to, leaving room below params.FinalLayerMaxBlockSize for the header and
+// system transactions. Zero means the upstream limit.
+func finalLayerSizeCap(config *params.ChainConfig) uint64 {
+	if config.Parlia == nil {
+		return 0
+	}
+	return params.FinalLayerMaxBlockSize - params.FinalLayerBlockSizeBufferZone
+}
+
+// errFinalLayerBlockOversized is returned instead of sealing a block that every
+// other node would reject. The producer writes its own block without
+// ValidateBody, so sealing it would fork the producer off the chain.
+var errFinalLayerBlockOversized = errors.New("assembled block exceeds the Final Layer size cap")
+
+// checkFinalLayerBlockSize rejects an assembled block above the consensus cap.
+func checkFinalLayerBlockSize(config *params.ChainConfig, block *types.Block) error {
+	if config.Parlia != nil && block.Size() > params.FinalLayerMaxBlockSize {
+		return fmt.Errorf("%w: %d > %d bytes", errFinalLayerBlockOversized, block.Size(), params.FinalLayerMaxBlockSize)
+	}
+	// system txs are added after the user gas pool closed; importers reject
+	// a block whose total gas exceeds the limit, so never seal one
+	if block.GasUsed() > block.GasLimit() {
+		return fmt.Errorf("assembled block exceeds gas limit: %d > %d", block.GasUsed(), block.GasLimit())
+	}
+	return nil
+}
 
 // newWorkReq represents a request for new sealing work submitting with relative interrupt notifier.
 type newWorkReq struct {
@@ -729,6 +763,7 @@ func (w *worker) makeEnv(parent *types.Header, header *types.Header, coinbase co
 		signer:   types.MakeSigner(w.chainConfig, header.Number, header.Time),
 		state:    state,
 		size:     uint64(header.Size()),
+		sizeCap:  finalLayerSizeCap(w.chainConfig),
 		coinbase: coinbase,
 		gasPool:  core.NewGasPool(header.GasLimit - gasReserved),
 		header:   header,
@@ -743,6 +778,14 @@ func (w *worker) makeEnv(parent *types.Header, header *types.Header, coinbase co
 func (w *worker) commitTransaction(env *environment, tx *types.Transaction, receiptProcessors ...core.ReceiptProcessor) ([]*types.Log, error) {
 	if tx.Type() == types.BlobTxType {
 		return w.commitBlobTransaction(env, tx, receiptProcessors...)
+	}
+	// A pool transaction must never look like (or be refused as) a system
+	// transaction: including one would make our own block invalid (chain
+	// review 2, N-1). System transactions are only added by the engine.
+	if posa, ok := w.engine.(consensus.PoSA); ok {
+		if isSystem, err := posa.IsSystemTransaction(tx, env.header); isSystem || err != nil {
+			return nil, errSystemLikePoolTx
+		}
 	}
 
 	receipt, err := w.applyTransaction(env, tx, receiptProcessors...)
@@ -1248,6 +1291,9 @@ func (w *worker) generateWork(genParam *generateParams, witness bool) *newPayloa
 	if err != nil {
 		return &newPayloadResult{err: err}
 	}
+	if err := checkFinalLayerBlockSize(w.chainConfig, block); err != nil {
+		return &newPayloadResult{err: err}
+	}
 
 	return &newPayloadResult{
 		block:    block,
@@ -1607,6 +1653,10 @@ func (w *worker) commit(env *environment, interval func(), start time.Time) erro
 		block, receipts, err := core.AssembleBlock(w.engine, w.chain, types.CopyHeader(env.header), env.state, &body, env.receipts)
 		env.committed = true
 		if err != nil {
+			return err
+		}
+		if err := checkFinalLayerBlockSize(w.chainConfig, block); err != nil {
+			log.Error("Refusing to seal oversized block", "number", block.Number(), "txs", len(body.Transactions), "err", err)
 			return err
 		}
 		env.txs = body.Transactions

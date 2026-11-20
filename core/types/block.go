@@ -35,6 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types/bal"
+	"github.com/ethereum/go-ethereum/crypto/pq"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
@@ -676,7 +677,7 @@ func HeaderParentHashFromRLP(header []byte) common.Hash {
 	return common.BytesToHash(parentHash)
 }
 
-var extraSeal = 65 // Fixed number of extra-data suffix bytes reserved for signer seal
+var extraSeal = pq.SealSize // DashEVM: ML-DSA seal (scheme || pubkey || signature) reserved at the end of extra-data
 
 // SealHash returns the hash of a block prior to it being sealed.
 func SealHash(header *Header, chainId *big.Int) (hash common.Hash) {
@@ -715,6 +716,14 @@ func EncodeSigHeader(w io.Writer, header *Header, chainId *big.Int) {
 		if header.RequestsHash != nil {
 			toEncode = append(toEncode, header.RequestsHash)
 		}
+	}
+	// DashEVM / CardanoEVM (Amsterdam seal-hash gap): the EIP-7928 / EIP-7843
+	// fields are sealed too once a header carries either, so no Amsterdam
+	// header field is ever outside the seal. Parlia accepts SlotNumber only
+	// from Amsterdam on and BlockAccessListHash never, so every header valid
+	// today (both nil) keeps its seal hash.
+	if header.BlockAccessListHash != nil || header.SlotNumber != nil {
+		toEncode = append(toEncode, header.BlockAccessListHash, header.SlotNumber)
 	}
 	err := rlp.Encode(w, toEncode)
 	if err != nil {
