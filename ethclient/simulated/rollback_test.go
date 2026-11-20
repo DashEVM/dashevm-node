@@ -20,13 +20,13 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/node"
-	"github.com/ethereum/go-ethereum/params"
 )
 
 // TestTransactionRollbackBehavior tests that calling Rollback on the simulated backend doesn't prevent subsequent
@@ -46,7 +46,17 @@ func TestTransactionRollbackBehavior(t *testing.T) {
 	defer sim.Close()
 	client := sim.Client()
 
-	btx0 := testSendSignedTx(t, testKey, sim, true, 0)
+	// DashEVM does not accept blob transactions, so the rollback is checked with
+	// plain transactions from both accounts.
+	blob, err := newBlobTx(sim, testKey, 0)
+	if err != nil {
+		t.Fatalf("failed to create blob transaction: %v", err)
+	}
+	if err := client.SendTransaction(context.Background(), blob); err == nil || !strings.Contains(err.Error(), "blob transactions are not accepted") {
+		t.Fatalf("expected the blob transaction to be refused, got %v", err)
+	}
+
+	btx0 := testSendSignedTx(t, testKey, sim, false, 0)
 	tx0 := testSendSignedTx(t, testKey2, sim, false, 0)
 	tx1 := testSendSignedTx(t, testKey2, sim, false, 1)
 
@@ -56,13 +66,7 @@ func TestTransactionRollbackBehavior(t *testing.T) {
 		t.Fatalf("all transactions were not rolled back")
 	}
 
-	// BEP-657: blob txs only allowed in blocks where N % BlobEligibleBlockInterval == 0.
-	// Advance block number so the next commit lands on a blob-eligible block.
-	for i := uint64(1); i < params.BlobEligibleBlockInterval; i++ {
-		sim.Commit()
-	}
-
-	btx2 := testSendSignedTx(t, testKey, sim, true, 0)
+	btx2 := testSendSignedTx(t, testKey, sim, false, 0)
 	tx2 := testSendSignedTx(t, testKey2, sim, false, 0)
 	tx3 := testSendSignedTx(t, testKey2, sim, false, 1)
 

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	rand2 "crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"io"
 	"math"
 	"math/big"
@@ -989,6 +990,13 @@ func testGetPooledTransaction(t *testing.T, blobTx bool) {
 		}
 	}
 	errs := backend.txpool.Add([]*types.Transaction{tx}, true)
+	if blobTx {
+		// DashEVM does not accept blob transactions, so there is nothing to serve.
+		if len(errs) != 1 || !errors.Is(errs[0], core.ErrTxTypeNotSupported) {
+			t.Fatalf("expected the blob tx to be refused, got %v", errs)
+		}
+		return
+	}
 	for _, err := range errs {
 		if err != nil {
 			t.Fatal(err)

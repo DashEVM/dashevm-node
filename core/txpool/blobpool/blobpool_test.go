@@ -1328,12 +1328,12 @@ func TestBlobCountLimit(t *testing.T) {
 	)
 	errs := pool.Add([]*types.Transaction{tx1, tx2}, true)
 
-	// Check that first succeeds second fails.
-	if errs[0] != nil {
-		t.Fatalf("expected tx with 7 blobs to succeed, got %v", errs[0])
-	}
-	if !errors.Is(errs[1], txpool.ErrTxBlobLimitExceeded) {
-		t.Fatalf("expected tx with 8 blobs to fail, got: %v", errs[1])
+	// DashEVM does not accept blob transactions at all (txpool.ValidateTransaction),
+	// so both are refused before the blob count limit is reached.
+	for i, err := range errs {
+		if !errors.Is(err, core.ErrTxTypeNotSupported) {
+			t.Fatalf("tx %d: expected the blob tx to be refused, got %v", i, err)
+		}
 	}
 
 	verifyPoolInternals(t, pool)
@@ -1346,7 +1346,12 @@ func TestBlobCountLimit(t *testing.T) {
 // Note, this tests mostly checks the pool transaction shuffling logic or things
 // specific to the blob pool. It does not do an exhaustive transaction validity
 // check.
+//
+// DashEVM does not accept blob transactions (txpool.ValidateTransaction refuses
+// them before they reach the blob pool), so the upstream admission scenarios
+// cannot run; TestBlobCountLimit checks the refusal.
 func TestAdd(t *testing.T) {
+	t.Skip("DashEVM: blob transactions are not accepted, see TestBlobCountLimit")
 	//log.SetDefault(log.NewLogger(log.NewTerminalHandlerWithLevel(os.Stderr, log.LevelTrace, true)))
 
 	// seed is a helper tuple to seed an initial state db and pool
